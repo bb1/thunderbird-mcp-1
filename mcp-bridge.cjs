@@ -11,7 +11,35 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const THUNDERBIRD_HOSTS = ['127.0.0.1'];
+// WSL2 (NAT networking): the Thunderbird server on the Windows host is
+// reachable from the WSL VM through the NAT gateway, not 127.0.0.1.
+// The gateway (the Windows host IP) is the nameserver in /etc/resolv.conf;
+// read it at startup so the bridge dials the right machine without
+// manual configuration.
+function isWsl({ fsImpl = fs } = {}) {
+  try {
+    const version = fsImpl.readFileSync('/proc/version', 'utf8');
+    return /microsoft/i.test(version) && /wsl/i.test(version);
+  } catch {
+    return false;
+  }
+}
+
+function detectWslGatewayIp({ fsImpl = fs } = {}) {
+  if (!isWsl({ fsImpl })) return null;
+  try {
+    const resolv = fsImpl.readFileSync('/etc/resolv.conf', 'utf8');
+    const match = resolv.match(/^nameserver\s+(\S+)/m);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+const wslGatewayIp = detectWslGatewayIp();
+const THUNDERBIRD_HOSTS = wslGatewayIp && wslGatewayIp !== '127.0.0.1'
+  ? [wslGatewayIp, '127.0.0.1']
+  : ['127.0.0.1'];
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
@@ -1297,6 +1325,9 @@ async function handleMessage(line) {
 }
 
 // BEGIN BRIDGE HTTP REQUEST HELPERS
+// Fail fast on unreachable candidates (e.g. a filtered WSL NAT gateway) so
+// the host fallback can move on without waiting out REQUEST_TIMEOUT.
+const CONNECT_TIMEOUT = 2000;
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
 // Whole message reads (including batches) have a 120 s extension deadline.
@@ -1390,9 +1421,19 @@ function tryRequest(hostname, postData, port, token, policy) {
       });
     });
 
+    // The connect phase gets its own short deadline: an unreachable
+    // candidate must fail fast so tryAllHosts can try the next host.
+    const connectTimer = setTimeout(() => {
+      if (!connected) {
+        const error = new Error(`Connection to ${hostname} timed out after ${CONNECT_TIMEOUT}ms`);
+        error.code = 'ETIMEDOUT';
+        connectionFailed(error);
+        req.destroy();
+      }
+    }, CONNECT_TIMEOUT);
     req.on('socket', (socket) => {
-      if (socket.connecting) socket.once('connect', () => { connected = true; });
-      else connected = true;
+      if (socket.connecting) socket.once('connect', () => { connected = true; clearTimeout(connectTimer); });
+      else { connected = true; clearTimeout(connectTimer); }
     });
     req.on('error', connectionFailed);
     req.on('close', () => connectionFailed(new Error('Connection to Thunderbird closed before a complete response')));
@@ -1439,7 +1480,7 @@ function isJsonRpcResponse(response, requestId) {
 function tryAllHosts(hosts, postData, port, token, policy) {
   const tryNext = ([hostname, ...rest]) => {
     return tryRequest(hostname, postData, port, token, policy).catch((err) => {
-      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
+      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'ETIMEDOUT')) {
         return tryNext(rest);
       }
       throw err;
@@ -1667,6 +1708,7 @@ module.exports = {
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
   createDiscoveryContext,
+  detectWslGatewayIp,
   discoverConnectionInfo,
   findFlatpakConnectionCandidates,
   findMacOsConnectionCandidates,
@@ -1675,6 +1717,7 @@ module.exports = {
   compactToolResultJsonText,
   inlineAttachmentPaths,
   isSensitiveFilePath,
+  isWsl,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
